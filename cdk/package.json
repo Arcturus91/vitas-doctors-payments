@@ -1,0 +1,22 @@
+{
+  "name": "vitas-payments-module-cdk",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc",
+    "synth": "npx cdk synth",
+    "deploy:dev": "ENVIRONMENT=dev npx cdk deploy --all --require-approval never",
+    "deploy:prod": "ENVIRONMENT=prod npx cdk deploy --all --require-approval never"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.170.0",
+    "constructs": "^10.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "aws-cdk": "^2.170.0",
+    "esbuild": "^0.27.4",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.0.0"
+  }
+}

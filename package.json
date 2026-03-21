@@ -1,0 +1,9 @@
+{
+  "name": "vitas-payments-module",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Reusable CDK construct for subscriptions & payments — MercadoPago initial provider",
+  "devDependencies": {
+    "esbuild": "^0.27.4"
+  }
+}
