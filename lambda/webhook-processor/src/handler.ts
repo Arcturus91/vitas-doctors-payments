@@ -5,6 +5,7 @@ import {
 } from '@aws-sdk/client-eventbridge';
 import { logger } from '../../shared/src/logger';
 import {
+  getSubscription,
   getSubscriptionByProviderId,
   updateSubscriptionStatus,
   upsertPayment,
@@ -100,18 +101,24 @@ async function processPaymentNotification(
   // 1. Fetch authoritative data from MP — never trust the webhook body alone
   const normalized = await provider.getPayment(providerPaymentId);
 
-  if (!normalized.providerSubscriptionId) {
-    logger.warn('webhook-processor: payment has no providerSubscriptionId — one-off charge?', {
+  // 2. Resolve local subscription — by providerSubscriptionId (preference_id) or userId from metadata
+  let sub = normalized.providerSubscriptionId
+    ? await getSubscriptionByProviderId(normalized.providerSubscriptionId)
+    : null;
+
+  if (!sub && normalized.userId) {
+    logger.info('webhook-processor: preference_id not found, falling back to userId lookup', {
       providerPaymentId,
+      userId: normalized.userId,
     });
-    return;
+    sub = await getSubscription(normalized.userId);
   }
 
-  // 2. Resolve local subscription
-  const sub = await getSubscriptionByProviderId(normalized.providerSubscriptionId);
   if (!sub) {
     logger.warn('webhook-processor: subscription not found for payment', {
+      providerPaymentId,
       providerSubscriptionId: normalized.providerSubscriptionId,
+      userId: normalized.userId,
     });
     return;
   }
@@ -148,9 +155,10 @@ async function processPaymentNotification(
   if (normalized.status === 'SUCCESS') {
     // Activate: covers PENDING (first payment) and PAST_DUE (recovery payment)
     if (['PENDING', 'PAST_DUE', 'TRIAL'].includes(sub.status)) {
-      // Set expiry 30 days from now (one-time billing cycle)
-      const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-      const ttl       = Math.floor(Date.now() / 1000) + 30 * 24 * 60 * 60;
+      const daysMap: Record<string, number> = { monthly: 30, yearly: 365 };
+      const days      = daysMap[sub.billingCycle] ?? 30;
+      const expiresAt = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString();
+      const ttl       = Math.floor(Date.now() / 1000) + days * 24 * 60 * 60;
       await safeUpdateStatus(sub.userId, 'ACTIVE', sub.status, { expiresAt, ttl });
     }
   } else if (normalized.status === 'FAILED') {

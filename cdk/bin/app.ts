@@ -8,9 +8,14 @@ import { SubscriptionModule } from '../lib/subscription-construct';
 const app   = new cdk.App();
 const stage = (app.node.tryGetContext('stage') as string | undefined) ?? 'dev';
 
+const prodAccount = process.env.PROD_ACCOUNT_ID;
+if (stage === 'prod' && !prodAccount) {
+  throw new Error('PROD_ACCOUNT_ID environment variable is required for prod deployment');
+}
+
 const envConfig: Record<string, { account: string; region: string }> = {
-  dev:  { account: '197517026286',    region: 'sa-east-1' },
-  prod: { account: 'PROD_ACCOUNT_ID', region: 'sa-east-1' }, // TODO: fill before prod deploy
+  dev:  { account: '197517026286',              region: 'sa-east-1' },
+  prod: { account: prodAccount ?? 'UNRESOLVED', region: 'sa-east-1' },
 };
 
 if (!envConfig[stage]) {
@@ -74,6 +79,12 @@ class VitasPaymentsStack extends cdk.Stack {
       tableNamePrefix: 'vitas',
       useFifoQueue:    isProd,
       enableEventBridge: isProd,
+
+      // When a subscription becomes ACTIVE/TRIAL, set ai_features.enabled/web_assistant/scribe = true
+      // When it becomes CANCELED/PAST_DUE, set them to false
+      doctorsTableName: 'Doctors_Table_V2',
+      // Fallback: resolve doctor_id from user_id for subscriptions created before doctorId was stored
+      usersTableName: 'Users_Table',
 
       // Optional: set this to an existing SNS topic ARN to receive alarm notifications
       // alarmTopicArn: `arn:aws:sns:sa-east-1:${this.account}:vitas-ops-alerts`,

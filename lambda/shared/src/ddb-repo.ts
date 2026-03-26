@@ -42,6 +42,33 @@ export function getPlansTableName(): string {
   return name;
 }
 
+export function getDoctorsTableName(): string | null {
+  return process.env.DOCTORS_TABLE_NAME ?? null;
+}
+
+export function getUsersTableName(): string | null {
+  return process.env.USERS_TABLE_NAME ?? null;
+}
+
+/**
+ * Resolve doctor_id from Users_Table using user_id.
+ * Fallback for subscriptions created before doctorId was stored on the item.
+ * Only runs when USERS_TABLE_NAME env var is set.
+ */
+export async function getDoctorIdForUser(userId: string): Promise<string | null> {
+  const tableName = getUsersTableName();
+  if (!tableName) return null;
+
+  const params: GetCommandInput = {
+    TableName: tableName,
+    Key: { user_id: userId },
+    ProjectionExpression: 'doctor_id',
+  };
+  const result = await ddb.send(new GetCommand(params));
+  const doctorId = result.Item?.doctor_id;
+  return doctorId && typeof doctorId === 'string' ? doctorId : null;
+}
+
 // ─── Repository Functions ─────────────────────────────────────────────────────
 
 /** Get a plan by planId from Plans_Table */
@@ -91,14 +118,16 @@ export async function getSubscriptionByProviderId(
 
 /**
  * Write a new subscription item.
- * Uses condition: attribute_not_exists(PK) to prevent overwriting an existing subscription.
- * Throws ConditionalCheckFailedException if subscription already exists.
+ * Allows overwriting an existing PENDING record (user abandoned checkout and is retrying).
+ * Throws ConditionalCheckFailedException if a live subscription already exists.
  */
 export async function createSubscription(subscription: Subscription): Promise<void> {
   const params: PutCommandInput = {
     TableName: getCoreTableName(),
     Item: subscription,
-    ConditionExpression: 'attribute_not_exists(PK)',
+    ConditionExpression: 'attribute_not_exists(PK) OR #s = :pending',
+    ExpressionAttributeNames: { '#s': 'status' },
+    ExpressionAttributeValues: { ':pending': 'PENDING' },
   };
   await ddb.send(new PutCommand(params));
 }
@@ -209,6 +238,29 @@ export async function incrementUsage(
   };
   const result = await ddb.send(new UpdateCommand(params));
   return (result.Attributes?.count as number) ?? 1;
+}
+
+/**
+ * Enable or disable AI features for a doctor in Doctors_Table_V2.
+ * Only runs when DOCTORS_TABLE_NAME env var is set (Vitas-specific integration).
+ * Does NOT touch chatbot_booking — that flag is controlled by the clinic owner.
+ */
+export async function updateDoctorAiFeatures(
+  doctorId: string,
+  enabled: boolean,
+): Promise<void> {
+  const tableName = getDoctorsTableName();
+  if (!tableName) return; // not configured — skip silently
+
+  const params: UpdateCommandInput = {
+    TableName: tableName,
+    Key: { doctor_id: doctorId },
+    UpdateExpression:
+      'SET ai_features.#enabled = :v, ai_features.web_assistant = :v, ai_features.scribe = :v',
+    ExpressionAttributeNames: { '#enabled': 'enabled' },
+    ExpressionAttributeValues: { ':v': enabled },
+  };
+  await ddb.send(new UpdateCommand(params));
 }
 
 /**

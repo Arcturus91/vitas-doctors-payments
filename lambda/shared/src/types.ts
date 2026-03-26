@@ -49,6 +49,8 @@ export interface Subscription {
   subscriptionId: string;
   userId: string;
   tenantId?: string;                    // optional — for multi-tenant SaaS (e.g. Vitas clinic)
+  /** Platform-specific doctor/user record ID — used to update ai_features on activation */
+  doctorId?: string;
   planId: string;
   status: SubscriptionStatus;
   billingCycle: BillingCycle;
@@ -123,6 +125,8 @@ export interface SubscriptionEvent {
  */
 export interface AuthContext {
   userId: string;
+  /** Platform-specific doctor/user identifier — extracted from JWT when present */
+  doctorId?: string;
 }
 
 // ─── Feature Gating ───────────────────────────────────────────────────────────

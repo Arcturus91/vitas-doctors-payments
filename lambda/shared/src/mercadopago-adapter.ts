@@ -173,6 +173,14 @@ export class MercadoPagoAdapter implements IPaymentProvider {
   async getPayment(providerPaymentId: string): Promise<NormalizedPayment> {
     const data = await this.mpFetch('GET', `/v1/payments/${providerPaymentId}`);
 
+    const metadata = data['metadata'] as Record<string, unknown> | undefined;
+
+    logger.info('MercadoPago: payment data fields', {
+      preapproval_id: data['preapproval_id'],
+      preference_id: data['preference_id'],
+      metadata,
+    });
+
     return {
       providerPaymentId:        String(data['id']),
       // preapproval_id is set for recurring subscriptions; preference_id for Checkout Pro one-time payments
@@ -181,6 +189,8 @@ export class MercadoPagoAdapter implements IPaymentProvider {
         : data['preference_id']
           ? String(data['preference_id'])
           : undefined,
+      // user_id from preference metadata — fallback lookup when preference_id is absent
+      userId: metadata?.['user_id'] ? String(metadata['user_id']) : undefined,
       status:                   mapPaymentStatus(String(data['status'] ?? '')),
       amount:                   Number(data['transaction_amount'] ?? 0),
       currency:                 String(data['currency_id'] ?? ''),

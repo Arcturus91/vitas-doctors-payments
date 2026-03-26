@@ -16,7 +16,7 @@ const sqs = new SQSClient({});
  * Responsibilities:
  *   - Accept the raw webhook payload
  *   - Enqueue the message to SQS for async processing by webhook-processor
- *   - Return 200 immediately — even if SQS fails (log only, no propagation)
+ *   - Return 500 on SQS failure so MercadoPago retries the notification
  *
  * Security: MercadoPago does not provide a verifiable signature.
  *   Trust is enforced downstream in webhook-processor, which always re-fetches
@@ -35,12 +35,23 @@ export const handler: APIGatewayProxyHandler = async (event) => {
     const queueUrl = process.env.WEBHOOK_QUEUE_URL;
     if (!queueUrl) {
       logger.error('webhook-receiver: WEBHOOK_QUEUE_URL not configured');
-      // Still return 200 — misconfiguration should not cause MP to retry forever
-      return { statusCode: 200, body: JSON.stringify({ received: true }) };
+      return { statusCode: 500, body: JSON.stringify({ error: 'Queue not configured' }) };
     }
 
-    // FIFO queues (URL ends with .fifo) require MessageGroupId
+    // FIFO queues (URL ends with .fifo) require MessageGroupId.
+    // Use the payment/resource ID from the notification so different subscriptions
+    // process concurrently while preserving per-subscription ordering.
     const isFifo = queueUrl.endsWith('.fifo');
+
+    let messageGroupId = 'unknown';
+    if (isFifo) {
+      try {
+        const parsed = JSON.parse(event.body ?? '{}') as { data?: { id: string }; id?: string };
+        messageGroupId = String(parsed.data?.id || parsed.id || 'unknown');
+      } catch {
+        // keep 'unknown' — still better than a single shared group
+      }
+    }
 
     const messageBody = JSON.stringify({
       provider:   'mercadopago',
@@ -52,15 +63,14 @@ export const handler: APIGatewayProxyHandler = async (event) => {
       QueueUrl:    queueUrl,
       MessageBody: messageBody,
       ...(isFifo && {
-        // All MP webhooks share a group — preserves per-subscription ordering
-        MessageGroupId: 'mercadopago-webhooks',
+        MessageGroupId: messageGroupId,
         // Content-based deduplication is enabled on the FIFO queue; no need for explicit ID
       }),
     };
 
     await sqs.send(new SendMessageCommand(sendInput));
 
-    logger.info('webhook-receiver: enqueued to SQS', { queueUrl, isFifo });
+    logger.info('webhook-receiver: enqueued to SQS', { queueUrl, isFifo, messageGroupId });
 
     return {
       statusCode: 200,
@@ -68,14 +78,14 @@ export const handler: APIGatewayProxyHandler = async (event) => {
       body: JSON.stringify({ received: true }),
     };
   } catch (error) {
-    // Always return 200 — do NOT let MP retry indefinitely due to our infrastructure issues
-    logger.error('webhook-receiver: failed to enqueue (returning 200 to prevent MP retries)', {
+    // Return 500 so MercadoPago retries the notification. The processor is idempotent.
+    logger.error('webhook-receiver: failed to enqueue', {
       error: error instanceof Error ? error.message : String(error),
     });
     return {
-      statusCode: 200,
+      statusCode: 500,
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ received: true }),
+      body: JSON.stringify({ error: 'Internal error' }),
     };
   }
 };

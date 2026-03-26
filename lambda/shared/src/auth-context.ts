@@ -101,7 +101,13 @@ export async function resolveAuthContext(event: APIGatewayProxyEvent): Promise<A
       throw new UnauthorizedError('Token missing user_id claim');
     }
 
-    return { userId };
+    // doctor_id is present in Vitas doctor/owner tokens — used for ai_features updates
+    const rawDoctorId = payload['doctor_id'] ?? payload['doctorId'];
+    const doctorId = rawDoctorId && String(rawDoctorId) !== 'undefined' && String(rawDoctorId) !== 'null'
+      ? String(rawDoctorId)
+      : undefined;
+
+    return { userId, doctorId };
   } catch (err) {
     throw new UnauthorizedError(
       err instanceof UnauthorizedError ? err.message : 'Invalid or expired token',

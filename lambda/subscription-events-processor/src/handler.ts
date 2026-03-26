@@ -4,6 +4,7 @@ import {
   PutEventsCommand,
 } from '@aws-sdk/client-eventbridge';
 import { logger } from '../../shared/src/logger';
+import { updateDoctorAiFeatures, getDoctorIdForUser } from '../../shared/src/ddb-repo';
 
 const ebClient = new EventBridgeClient({});
 
@@ -68,6 +69,7 @@ async function processSubscriptionChange(record: DynamoDBRecord): Promise<void> 
   const oldStatus = oldImage?.status?.S;
   const userId    = newImage?.userId?.S;
   const subId     = newImage?.subscriptionId?.S;
+  const doctorId  = newImage?.doctorId?.S;
 
   // Only act when the status actually changed
   if (!newStatus || newStatus === oldStatus) return;
@@ -75,6 +77,31 @@ async function processSubscriptionChange(record: DynamoDBRecord): Promise<void> 
   logger.info('subscription-events-processor: status changed', {
     userId, subscriptionId: subId, oldStatus, newStatus, eventName: record.eventName,
   });
+
+  // ── AI features side-effect (Vitas-specific) ───────────────────────────
+  // DOCTORS_TABLE_NAME is only set when deployed in Vitas — skipped silently otherwise.
+  const shouldEnable  = newStatus === 'ACTIVE' || newStatus === 'TRIAL' || newStatus === 'PENDING_CANCEL';
+  const shouldDisable = newStatus === 'CANCELED' || newStatus === 'PAST_DUE';
+
+  if ((shouldEnable || shouldDisable) && userId) {
+    try {
+      // Use doctorId stored on the subscription, falling back to Users_Table lookup
+      // (fallback handles subscriptions created before doctorId was stored on the item)
+      const resolvedDoctorId = doctorId ?? await getDoctorIdForUser(userId);
+      if (resolvedDoctorId) {
+        await updateDoctorAiFeatures(resolvedDoctorId, shouldEnable);
+        logger.info('subscription-events-processor: ai_features updated', {
+          doctorId: resolvedDoctorId, enabled: shouldEnable, newStatus,
+        });
+      }
+    } catch (err) {
+      // Non-fatal — log but don't fail stream processing
+      logger.error('subscription-events-processor: ai_features update failed', {
+        doctorId, userId, newStatus,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 
   if (process.env.ENABLE_EVENT_BRIDGE === 'true') {
     await publishEvent('subscription.status.changed', {

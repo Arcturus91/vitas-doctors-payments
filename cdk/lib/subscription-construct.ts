@@ -70,6 +70,25 @@ export interface SubscriptionModuleProps {
    * If omitted, alarms are created but have no action.
    */
   alarmTopicArn?: string;
+
+  /**
+   * Name of the platform's doctors table to update when subscription status changes.
+   * When provided, subscription-events-processor will set ai_features.enabled/web_assistant/scribe
+   * to true on ACTIVE/TRIAL and false on CANCELED/PAST_DUE.
+   *
+   * Vitas-specific: pass the Doctors_Table_V2 table name here.
+   * Omit for platforms that do not have a doctors table.
+   */
+  doctorsTableName?: string;
+
+  /**
+   * Name of the platform's users table.
+   * When provided, subscription-events-processor uses it to resolve doctor_id from user_id
+   * as a fallback when doctorId is not stored on the subscription item.
+   *
+   * Vitas-specific: pass the Users_Table name here.
+   */
+  usersTableName?: string;
 }
 
 // ─── Construct ────────────────────────────────────────────────────────────────
@@ -316,6 +335,7 @@ export class SubscriptionModule extends Construct {
         bundling:     commonBundling,
         environment:  { ...commonEnv, ...extraEnv },
         logRetention: logs.RetentionDays.ONE_WEEK,
+        tracing:      lambda.Tracing.ACTIVE,
       });
       return fn;
     };
@@ -360,7 +380,11 @@ export class SubscriptionModule extends Construct {
       'SubscriptionEventsProcessorFn',
       'subscription-events-processor',
       30,
-      { ENABLE_EVENT_BRIDGE: String(enableEventBridge) },
+      {
+        ENABLE_EVENT_BRIDGE: String(enableEventBridge),
+        ...(props.doctorsTableName ? { DOCTORS_TABLE_NAME: props.doctorsTableName } : {}),
+        ...(props.usersTableName   ? { USERS_TABLE_NAME:   props.usersTableName   } : {}),
+      },
     );
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -481,6 +505,24 @@ export class SubscriptionModule extends Construct {
       'dynamodb:GetItem',
       'dynamodb:UpdateItem',
     );
+    // Vitas-specific: update ai_features in Doctors_Table_V2 on status change
+    if (props.doctorsTableName) {
+      const doctorsTableArn = `arn:aws:dynamodb:${cdk.Stack.of(this).region}:${cdk.Stack.of(this).account}:table/${props.doctorsTableName}`;
+      this.subscriptionEventsProcessorFn.addToRolePolicy(new iam.PolicyStatement({
+        effect:    iam.Effect.ALLOW,
+        actions:   ['dynamodb:UpdateItem'],
+        resources: [doctorsTableArn],
+      }));
+    }
+    // Vitas-specific: resolve doctor_id from Users_Table for subscriptions without doctorId
+    if (props.usersTableName) {
+      const usersTableArn = `arn:aws:dynamodb:${cdk.Stack.of(this).region}:${cdk.Stack.of(this).account}:table/${props.usersTableName}`;
+      this.subscriptionEventsProcessorFn.addToRolePolicy(new iam.PolicyStatement({
+        effect:    iam.Effect.ALLOW,
+        actions:   ['dynamodb:GetItem'],
+        resources: [usersTableArn],
+      }));
+    }
     // DynamoDB Stream read permission is added automatically by addEventSource above
 
     // ── Optional: EventBridge PutEvents ─────────────────────────────────────

@@ -67,8 +67,14 @@ ENVIRONMENT="$ENVIRONMENT" npx cdk synth $CDK_CONTEXT $CDK_PROFILE
 # ── 4. CDK deploy ──────────────────────────────────────────────────────────
 echo ""
 echo "==> [4/4] Deploying to AWS (environment: $ENVIRONMENT)..."
+# Prod requires explicit approval for any IAM/security-group changes (broadening permissions).
+# Dev deploys silently (--require-approval never) to speed up iteration.
+APPROVAL_FLAG="--require-approval never"
+if [[ "$ENVIRONMENT" == "prod" ]]; then
+  APPROVAL_FLAG="--require-approval broadening"
+fi
 # shellcheck disable=SC2086
-ENVIRONMENT="$ENVIRONMENT" npx cdk deploy --require-approval never --all $CDK_CONTEXT $CDK_PROFILE
+ENVIRONMENT="$ENVIRONMENT" npx cdk deploy $APPROVAL_FLAG --all $CDK_CONTEXT $CDK_PROFILE
 
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

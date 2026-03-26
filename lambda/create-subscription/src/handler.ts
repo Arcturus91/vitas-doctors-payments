@@ -17,14 +17,16 @@ import { getMercadoPagoAccessToken } from '../../shared/src/secrets';
 import { providerFactory } from '../../shared/src/provider';
 import type { Subscription } from '../../shared/src/types';
 
-// Statuses that indicate a user already has a live subscription
+// Statuses that block creating a new subscription.
+// PENDING is excluded: it means the user opened checkout but didn't pay yet,
+// so they should be allowed to retry (the old PENDING record gets overwritten).
 const BLOCKING_STATUSES: ReadonlySet<string> = new Set([
-  'ACTIVE', 'TRIAL', 'PENDING', 'PAST_DUE', 'PENDING_CANCEL',
+  'ACTIVE', 'TRIAL', 'PAST_DUE', 'PENDING_CANCEL',
 ]);
 
 export const handler: APIGatewayProxyHandler = async (event) => {
   try {
-    const { userId } = await resolveAuthContext(event);
+    const { userId, doctorId } = await resolveAuthContext(event);
 
     // ── Parse & validate body ─────────────────────────────────────────────
     const body = JSON.parse(event.body ?? '{}') as {
@@ -83,16 +85,18 @@ export const handler: APIGatewayProxyHandler = async (event) => {
     // ── Build subscription item ───────────────────────────────────────────
     const now            = new Date().toISOString();
     const subscriptionId = crypto.randomUUID();
-    const isTrialPlan    = (plan.trialDays ?? 0) > 0;
 
+    // Status starts as PENDING regardless of trial — access is only granted
+    // after the webhook confirms a successful payment (Checkout Pro flow).
     const subscription: Subscription = {
       PK:     `USER#${userId}`,
       SK:     'SUBSCRIPTION#primary',
       entity: 'subscription',
       subscriptionId,
       userId,
+      ...(doctorId ? { doctorId } : {}),
       planId:               plan.planId,
-      status:               isTrialPlan ? 'TRIAL' : 'PENDING',
+      status:               'PENDING',
       billingCycle,
       provider:             'mercadopago',
       providerSubscriptionId,
@@ -100,11 +104,6 @@ export const handler: APIGatewayProxyHandler = async (event) => {
       GSI1SK:               `USER#${userId}`,
       limitsCached:         plan.limits,
       gracePeriodDays:      plan.gracePeriodDays,
-      ...(isTrialPlan && {
-        trialEndsAt: new Date(
-          Date.now() + plan.trialDays * 24 * 60 * 60 * 1000,
-        ).toISOString(),
-      }),
       createdAt:  now,
       updatedAt:  now,
     };

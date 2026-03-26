@@ -29,6 +29,8 @@ export interface CreateSubscriptionResult {
 export interface NormalizedPayment {
   providerPaymentId: string;
   providerSubscriptionId?: string;
+  /** user_id extracted from payment metadata — fallback when providerSubscriptionId is unavailable */
+  userId?: string;
   status: 'PENDING' | 'SUCCESS' | 'FAILED' | 'REFUNDED';
   amount: number;
   currency: string;
