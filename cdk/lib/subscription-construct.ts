@@ -72,23 +72,12 @@ export interface SubscriptionModuleProps {
   alarmTopicArn?: string;
 
   /**
-   * Name of the platform's doctors table to update when subscription status changes.
-   * When provided, subscription-events-processor will set ai_features.enabled/web_assistant/scribe
-   * to true on ACTIVE/TRIAL and false on CANCELED/PAST_DUE.
-   *
-   * Vitas-specific: pass the Doctors_Table_V2 table name here.
-   * Omit for platforms that do not have a doctors table.
+   * SSM Parameter Store path for the JWT secret used to validate Bearer tokens.
+   * Default: '/vitas/auth/jwt-secret' — matches the Vitas stack convention.
+   * Override when integrating with a different project that stores its JWT secret
+   * at a different SSM path (e.g. '/clinicpro/auth/jwt-secret').
    */
-  doctorsTableName?: string;
-
-  /**
-   * Name of the platform's users table.
-   * When provided, subscription-events-processor uses it to resolve doctor_id from user_id
-   * as a fallback when doctorId is not stored on the subscription item.
-   *
-   * Vitas-specific: pass the Users_Table name here.
-   */
-  usersTableName?: string;
+  jwtSecretParam?: string;
 }
 
 // ─── Construct ────────────────────────────────────────────────────────────────
@@ -133,6 +122,9 @@ export class SubscriptionModule extends Construct {
 
   /** Lambda: cancels a subscription */
   public readonly cancelSubscriptionFn: lambdaNodejs.NodejsFunction;
+
+  /** Lambda: generic usage tracking — checks and increments any metered feature */
+  public readonly trackUsageFn: lambdaNodejs.NodejsFunction;
 
   /** Lambda: receives MP webhooks and enqueues to SQS */
   public readonly webhookReceiverFn: lambdaNodejs.NodejsFunction;
@@ -307,7 +299,7 @@ export class SubscriptionModule extends Construct {
 
     // Shared env for Lambdas that validate the JWT directly (no API GW TOKEN authorizer).
     // Matches the vitas-main-stack pattern: each Lambda reads the secret from SSM at invocation time.
-    const jwtSecretParam = '/vitas/auth/jwt-secret';
+    const jwtSecretParam = props.jwtSecretParam ?? '/vitas/auth/jwt-secret';
     const authEnv: Record<string, string> = {
       JWT_SECRET_PARAM: jwtSecretParam,
     };
@@ -368,6 +360,11 @@ export class SubscriptionModule extends Construct {
       WEBHOOK_QUEUE_URL: this.webhookQueue.queueUrl,
     });
 
+    // POST /subscriptions/me/usage/{feature} — generic usage check + increment per metered feature
+    this.trackUsageFn = makeFn('TrackUsageFn', 'track-usage', 10, {
+      ...authEnv,
+    });
+
     // SQS-triggered — fetches from MP API, updates SaasCore, writes events
     // Timeout 60s: must be < visibilityTimeout/6 (370/6 ≈ 61s — keep at 60s)
     this.webhookProcessorFn = makeFn('WebhookProcessorFn', 'webhook-processor', 60, {
@@ -382,8 +379,6 @@ export class SubscriptionModule extends Construct {
       30,
       {
         ENABLE_EVENT_BRIDGE: String(enableEventBridge),
-        ...(props.doctorsTableName ? { DOCTORS_TABLE_NAME: props.doctorsTableName } : {}),
-        ...(props.usersTableName   ? { USERS_TABLE_NAME:   props.usersTableName   } : {}),
       },
     );
 
@@ -446,7 +441,7 @@ export class SubscriptionModule extends Construct {
       conditions: { StringEquals: { 'kms:ViaService': `ssm.${cdk.Stack.of(this).region}.amazonaws.com` } },
     });
 
-    for (const fn of [this.createSubscriptionFn, this.getSubscriptionFn, this.cancelSubscriptionFn]) {
+    for (const fn of [this.createSubscriptionFn, this.getSubscriptionFn, this.cancelSubscriptionFn, this.trackUsageFn]) {
       fn.addToRolePolicy(ssmJwtPolicy);
       fn.addToRolePolicy(kmsDecryptPolicy);
     }
@@ -460,6 +455,14 @@ export class SubscriptionModule extends Construct {
     // ── get-subscription ─────────────────────────────────────────────────────
     // Read-only: returns USER#userId / SUBSCRIPTION#primary item
     this.saasCoreTable.grant(this.getSubscriptionFn, 'dynamodb:GetItem');
+
+    // ── track-usage ───────────────────────────────────────────────────────────
+    // Reads subscription + usage item, writes usage item (atomic ADD)
+    this.saasCoreTable.grant(
+      this.trackUsageFn,
+      'dynamodb:GetItem',
+      'dynamodb:UpdateItem',
+    );
 
     // ── cancel-subscription ──────────────────────────────────────────────────
     // Reads subscription, calls MP cancel API, updates status, writes event
@@ -505,24 +508,6 @@ export class SubscriptionModule extends Construct {
       'dynamodb:GetItem',
       'dynamodb:UpdateItem',
     );
-    // Vitas-specific: update ai_features in Doctors_Table_V2 on status change
-    if (props.doctorsTableName) {
-      const doctorsTableArn = `arn:aws:dynamodb:${cdk.Stack.of(this).region}:${cdk.Stack.of(this).account}:table/${props.doctorsTableName}`;
-      this.subscriptionEventsProcessorFn.addToRolePolicy(new iam.PolicyStatement({
-        effect:    iam.Effect.ALLOW,
-        actions:   ['dynamodb:UpdateItem'],
-        resources: [doctorsTableArn],
-      }));
-    }
-    // Vitas-specific: resolve doctor_id from Users_Table for subscriptions without doctorId
-    if (props.usersTableName) {
-      const usersTableArn = `arn:aws:dynamodb:${cdk.Stack.of(this).region}:${cdk.Stack.of(this).account}:table/${props.usersTableName}`;
-      this.subscriptionEventsProcessorFn.addToRolePolicy(new iam.PolicyStatement({
-        effect:    iam.Effect.ALLOW,
-        actions:   ['dynamodb:GetItem'],
-        resources: [usersTableArn],
-      }));
-    }
     // DynamoDB Stream read permission is added automatically by addEventSource above
 
     // ── Optional: EventBridge PutEvents ─────────────────────────────────────
@@ -544,6 +529,7 @@ export class SubscriptionModule extends Construct {
         this.createSubscriptionFn,
         this.getSubscriptionFn,
         this.cancelSubscriptionFn,
+        this.trackUsageFn,
         this.webhookProcessorFn,
         this.subscriptionEventsProcessorFn,
       ];
@@ -614,6 +600,14 @@ export class SubscriptionModule extends Construct {
     const meResource = subscriptionsResource.addResource('me');
     meResource.addMethod('GET', getSubIntegration, authorizedMethodOptions);
 
+    // POST /subscriptions/me/usage/{feature} → track-usage
+    // Generic metered usage endpoint. Any project calls this from its own BFF proxy
+    // before consuming a feature (e.g. chatbot_messages, ai_generations).
+    // The {feature} key must match a key in plan.limits.
+    const trackUsageIntegration = new apigateway.LambdaIntegration(this.trackUsageFn, { proxy: true });
+    const usageResource = meResource.addResource('usage');
+    usageResource.addResource('{feature}').addMethod('POST', trackUsageIntegration, authorizedMethodOptions);
+
     // POST /subscriptions/{id}/cancel → cancel-subscription
     // {id} is the subscriptionId. The Lambda validates it belongs to the caller.
     const subscriptionByIdResource = subscriptionsResource.addResource('{id}');
@@ -657,6 +651,7 @@ export class SubscriptionModule extends Construct {
       { fn: this.createSubscriptionFn,          name: 'CreateSubscription' },
       { fn: this.getSubscriptionFn,             name: 'GetSubscription' },
       { fn: this.cancelSubscriptionFn,          name: 'CancelSubscription' },
+      { fn: this.trackUsageFn,                  name: 'TrackUsage' },
       { fn: this.webhookReceiverFn,             name: 'WebhookReceiver' },
       { fn: this.webhookProcessorFn,            name: 'WebhookProcessor' },
       { fn: this.subscriptionEventsProcessorFn, name: 'SubscriptionEventsProcessor' },

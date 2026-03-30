@@ -42,33 +42,6 @@ export function getPlansTableName(): string {
   return name;
 }
 
-export function getDoctorsTableName(): string | null {
-  return process.env.DOCTORS_TABLE_NAME ?? null;
-}
-
-export function getUsersTableName(): string | null {
-  return process.env.USERS_TABLE_NAME ?? null;
-}
-
-/**
- * Resolve doctor_id from Users_Table using user_id.
- * Fallback for subscriptions created before doctorId was stored on the item.
- * Only runs when USERS_TABLE_NAME env var is set.
- */
-export async function getDoctorIdForUser(userId: string): Promise<string | null> {
-  const tableName = getUsersTableName();
-  if (!tableName) return null;
-
-  const params: GetCommandInput = {
-    TableName: tableName,
-    Key: { user_id: userId },
-    ProjectionExpression: 'doctor_id',
-  };
-  const result = await ddb.send(new GetCommand(params));
-  const doctorId = result.Item?.doctor_id;
-  return doctorId && typeof doctorId === 'string' ? doctorId : null;
-}
-
 // ─── Repository Functions ─────────────────────────────────────────────────────
 
 /** Get a plan by planId from Plans_Table */
@@ -211,6 +184,28 @@ export async function upsertPayment(payment: Payment): Promise<boolean> {
 }
 
 /**
+ * Read the current usage count for a feature scoped to a subscription.
+ * Returns 0 if no usage has been recorded yet.
+ */
+export async function getUsage(
+  userId: string,
+  feature: string,
+  subscriptionId: string,
+): Promise<number> {
+  const params: GetCommandInput = {
+    TableName: getCoreTableName(),
+    Key: {
+      PK: `USER#${userId}`,
+      SK: `USAGE#${feature}#${subscriptionId}`,
+    },
+    ProjectionExpression: '#count',
+    ExpressionAttributeNames: { '#count': 'count' },
+  };
+  const result = await ddb.send(new GetCommand(params));
+  return (result.Item?.count as number) ?? 0;
+}
+
+/**
  * Atomically increment a usage counter for the current billing period.
  * Returns the new count after increment.
  * Uses DynamoDB ADD — safe for concurrent calls.
@@ -218,7 +213,7 @@ export async function upsertPayment(payment: Payment): Promise<boolean> {
 export async function incrementUsage(
   userId: string,
   feature: string,
-  period: string, // YYYY-MM
+  period: string, // YYYY-MM or subscriptionId for per-subscription tracking
 ): Promise<number> {
   const params: UpdateCommandInput = {
     TableName: getCoreTableName(),
@@ -238,29 +233,6 @@ export async function incrementUsage(
   };
   const result = await ddb.send(new UpdateCommand(params));
   return (result.Attributes?.count as number) ?? 1;
-}
-
-/**
- * Enable or disable AI features for a doctor in Doctors_Table_V2.
- * Only runs when DOCTORS_TABLE_NAME env var is set (Vitas-specific integration).
- * Does NOT touch chatbot_booking — that flag is controlled by the clinic owner.
- */
-export async function updateDoctorAiFeatures(
-  doctorId: string,
-  enabled: boolean,
-): Promise<void> {
-  const tableName = getDoctorsTableName();
-  if (!tableName) return; // not configured — skip silently
-
-  const params: UpdateCommandInput = {
-    TableName: tableName,
-    Key: { doctor_id: doctorId },
-    UpdateExpression:
-      'SET ai_features.#enabled = :v, ai_features.web_assistant = :v, ai_features.scribe = :v',
-    ExpressionAttributeNames: { '#enabled': 'enabled' },
-    ExpressionAttributeValues: { ':v': enabled },
-  };
-  await ddb.send(new UpdateCommand(params));
 }
 
 /**

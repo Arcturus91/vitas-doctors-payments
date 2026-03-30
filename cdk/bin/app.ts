@@ -75,16 +75,11 @@ class VitasPaymentsStack extends cdk.Stack {
     const payments = new SubscriptionModule(this, 'Subscriptions', {
       restApi: restApi as apigateway.RestApi,
 
-      environment:     stackStage,
-      tableNamePrefix: 'vitas',
-      useFifoQueue:    isProd,
-      enableEventBridge: isProd,
-
-      // When a subscription becomes ACTIVE/TRIAL, set ai_features.enabled/web_assistant/scribe = true
-      // When it becomes CANCELED/PAST_DUE, set them to false
-      doctorsTableName: 'Doctors_Table_V2',
-      // Fallback: resolve doctor_id from user_id for subscriptions created before doctorId was stored
-      usersTableName: 'Users_Table',
+      environment:      stackStage,
+      tableNamePrefix:  'vitas',
+      useFifoQueue:     isProd,
+      // Always emit EventBridge events — vitas-main-stack subscribes to apply its own side-effects
+      enableEventBridge: true,
 
       // Optional: set this to an existing SNS topic ARN to receive alarm notifications
       // alarmTopicArn: `arn:aws:sns:sa-east-1:${this.account}:vitas-ops-alerts`,
