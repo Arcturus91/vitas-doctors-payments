@@ -11,9 +11,12 @@ import {
   upsertPayment,
   writeEvent,
   ConditionalCheckFailedException,
+  getBillingCycleByPeriod,
+  updateBillingCycleStatus,
 } from '../../shared/src/ddb-repo';
 import { getMercadoPagoAccessToken } from '../../shared/src/secrets';
 import { providerFactory } from '../../shared/src/provider';
+import type { NormalizedPayment } from '../../shared/src/provider';
 import type { Payment, Subscription } from '../../shared/src/types';
 
 const ebClient = new EventBridgeClient({});
@@ -123,7 +126,16 @@ async function processPaymentNotification(
     return;
   }
 
-  // 3. Idempotent payment upsert
+  // 3. Detect overage payment — metadata.plan_id starts with 'overage-'
+  const rawMeta = normalized.rawPayload['metadata'] as Record<string, unknown> | undefined;
+  const planId = rawMeta?.['plan_id'] ? String(rawMeta['plan_id']) : '';
+  if (planId.startsWith('overage-')) {
+    const period = planId.replace('overage-', ''); // e.g. '2026-03'
+    await processOveragePayment(sub, normalized, period);
+    return;
+  }
+
+  // 4. Idempotent payment upsert
   const now        = new Date().toISOString();
   const paymentId  = crypto.randomUUID();
   const paymentDate = now.substring(0, 10); // YYYY-MM-DD
@@ -287,6 +299,55 @@ async function safeUpdateStatus(
       return false;
     }
     throw err;
+  }
+}
+
+// ─── Overage payment handling ──────────────────────────────────────────────
+
+async function processOveragePayment(
+  sub: Subscription,
+  normalized: NormalizedPayment,
+  period: string,
+): Promise<void> {
+  const now = new Date().toISOString();
+  const cycle = await getBillingCycleByPeriod(sub.userId, period);
+
+  if (!cycle) {
+    logger.warn('webhook-processor: overage payment received but BillingCycle not found', {
+      userId: sub.userId, period,
+    });
+    return;
+  }
+
+  if (normalized.status === 'SUCCESS') {
+    await updateBillingCycleStatus(sub.userId, cycle.SK, 'CHARGED', {
+      paymentId: normalized.providerPaymentId,
+      updatedAt: now,
+    });
+    logger.info('webhook-processor: overage payment CHARGED', { userId: sub.userId, period, amount: normalized.amount });
+
+    await writeEvent({
+      PK:     `SUBSCRIPTION#${sub.subscriptionId}`,
+      SK:     `EVENT#${now}#${crypto.randomUUID()}`,
+      entity: 'event',
+      type:   'OVERAGE_PAYMENT_SUCCESS',
+      payload: { period, amount: normalized.amount, currency: normalized.currency },
+      createdAt: now,
+    });
+  } else if (normalized.status === 'FAILED') {
+    await updateBillingCycleStatus(sub.userId, cycle.SK, 'FAILED');
+    logger.info('webhook-processor: overage payment FAILED', { userId: sub.userId, period });
+
+    await writeEvent({
+      PK:     `SUBSCRIPTION#${sub.subscriptionId}`,
+      SK:     `EVENT#${now}#${crypto.randomUUID()}`,
+      entity: 'event',
+      type:   'OVERAGE_PAYMENT_FAILED',
+      payload: { period, amount: normalized.amount },
+      createdAt: now,
+    });
+  } else {
+    logger.info('webhook-processor: overage payment pending — no action', { userId: sub.userId, period, status: normalized.status });
   }
 }
 

@@ -12,7 +12,7 @@ let cachedSecret: string | null = null;
 let cacheExpiry = 0;
 
 async function getJwtSecret(): Promise<string> {
-  if (cachedSecret && Date.now() < cacheExpiry) return cachedSecret;
+  if (cachedSecret && Date.now() < cacheExpiry) return cachedSecret as string;
 
   const result = await ssm.send(new GetParameterCommand({
     Name:           process.env.JWT_SECRET_PARAM ?? '/vitas/auth/jwt-secret',
@@ -21,7 +21,7 @@ async function getJwtSecret(): Promise<string> {
 
   cachedSecret = result.Parameter?.Value ?? '';
   cacheExpiry  = Date.now() + 5 * 60 * 1000; // 5-minute cache
-  return cachedSecret;
+  return cachedSecret as string;
 }
 
 // ─── Lightweight HS256 JWT verification using Node.js built-in crypto ─────────

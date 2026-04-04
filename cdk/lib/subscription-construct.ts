@@ -4,6 +4,8 @@ import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as cloudwatchActions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
+import * as events from 'aws-cdk-lib/aws-events';
+import * as eventsTargets from 'aws-cdk-lib/aws-events-targets';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
@@ -134,6 +136,18 @@ export class SubscriptionModule extends Construct {
 
   /** Lambda: processes DynamoDB stream events for subscription lifecycle side-effects */
   public readonly subscriptionEventsProcessorFn: lambdaNodejs.NodejsFunction;
+
+  /** Lambda: hourly cron — transitions expired TRIAL/PAST_DUE to DOWNGRADED_TO_MANUAL */
+  public readonly expireSubscriptionsFn: lambdaNodejs.NodejsFunction;
+
+  /** Lambda: monthly cron (1st of month) — closes billing cycles, calculates overage */
+  public readonly monthlyCloseFn: lambdaNodejs.NodejsFunction;
+
+  /** Lambda: returns current period usage for all metered features */
+  public readonly getUsageFn: lambdaNodejs.NodejsFunction;
+
+  /** Lambda: creates a one-time MP checkout for outstanding overage payment */
+  public readonly payOverageFn: lambdaNodejs.NodejsFunction;
 
   /** CloudWatch alarm that fires when any message lands in the webhook DLQ */
   public readonly dlqDepthAlarm: cloudwatch.Alarm;
@@ -382,6 +396,22 @@ export class SubscriptionModule extends Construct {
       },
     );
 
+    // Hourly EventBridge cron — expire TRIAL/PAST_DUE subscriptions → DOWNGRADED_TO_MANUAL
+    this.expireSubscriptionsFn = makeFn('ExpireSubscriptionsFn', 'expire-subscriptions', 60);
+
+    // Monthly EventBridge cron — close billing cycles, calculate overage
+    this.monthlyCloseFn = makeFn('MonthlyCloseFn', 'monthly-close', 300);
+
+    // GET /subscriptions/me/usage — returns per-feature usage for the current period
+    this.getUsageFn = makeFn('GetUsageFn', 'get-usage', 10, { ...authEnv });
+
+    // POST /subscriptions/me/pay-overage — one-time checkout for outstanding overage
+    this.payOverageFn = makeFn('PayOverageFn', 'pay-overage', 30, {
+      ...authEnv,
+      MP_SECRET_ARN:  this.mpSecret.secretArn,
+      FRONTEND_URL:   '',  // override per deployment via environment variable or stack props
+    });
+
     // ─────────────────────────────────────────────────────────────────────────
     // Stage 4f — Event sources
     // ─────────────────────────────────────────────────────────────────────────
@@ -420,6 +450,22 @@ export class SubscriptionModule extends Construct {
       }),
     );
 
+    // EventBridge hourly rule → expire-subscriptions
+    new events.Rule(this, 'ExpireSubscriptionsRule', {
+      ruleName:    `${prefix}-expire-subscriptions-${env}`,
+      description: 'Hourly: transition expired TRIAL/PAST_DUE subscriptions to DOWNGRADED_TO_MANUAL',
+      schedule:    events.Schedule.rate(cdk.Duration.hours(1)),
+      targets:     [new eventsTargets.LambdaFunction(this.expireSubscriptionsFn)],
+    });
+
+    // EventBridge monthly cron → monthly-close (1st of each month at 05:10 UTC)
+    new events.Rule(this, 'MonthlyCloseRule', {
+      ruleName:    `${prefix}-monthly-close-${env}`,
+      description: 'Monthly (1st at 05:10 UTC): close billing cycles and calculate overage',
+      schedule:    events.Schedule.cron({ minute: '10', hour: '5', day: '1', month: '*', year: '*' }),
+      targets:     [new eventsTargets.LambdaFunction(this.monthlyCloseFn)],
+    });
+
     // ─────────────────────────────────────────────────────────────────────────
     // Stage 4g — IAM least-privilege grants
     //
@@ -441,7 +487,14 @@ export class SubscriptionModule extends Construct {
       conditions: { StringEquals: { 'kms:ViaService': `ssm.${cdk.Stack.of(this).region}.amazonaws.com` } },
     });
 
-    for (const fn of [this.createSubscriptionFn, this.getSubscriptionFn, this.cancelSubscriptionFn, this.trackUsageFn]) {
+    for (const fn of [
+      this.createSubscriptionFn,
+      this.getSubscriptionFn,
+      this.cancelSubscriptionFn,
+      this.trackUsageFn,
+      this.getUsageFn,
+      this.payOverageFn,
+    ]) {
       fn.addToRolePolicy(ssmJwtPolicy);
       fn.addToRolePolicy(kmsDecryptPolicy);
     }
@@ -510,6 +563,41 @@ export class SubscriptionModule extends Construct {
     );
     // DynamoDB Stream read permission is added automatically by addEventSource above
 
+    // ── expire-subscriptions ─────────────────────────────────────────────────
+    // Scans for expiring subscriptions, conditionally updates their status
+    this.saasCoreTable.grant(
+      this.expireSubscriptionsFn,
+      'dynamodb:Scan',
+      'dynamodb:UpdateItem',
+    );
+
+    // ── monthly-close ────────────────────────────────────────────────────────
+    // Scans subscriptions, reads usage, creates BillingCycle records
+    this.saasCoreTable.grant(
+      this.monthlyCloseFn,
+      'dynamodb:Scan',
+      'dynamodb:Query',
+      'dynamodb:GetItem',
+      'dynamodb:PutItem',
+    );
+
+    // ── get-usage ────────────────────────────────────────────────────────────
+    // Reads subscription + all USAGE items for the current period
+    this.saasCoreTable.grant(
+      this.getUsageFn,
+      'dynamodb:GetItem',
+      'dynamodb:Query',
+    );
+
+    // ── pay-overage ──────────────────────────────────────────────────────────
+    // Reads subscription, reads BillingCycle, calls MP to create preference
+    this.saasCoreTable.grant(
+      this.payOverageFn,
+      'dynamodb:GetItem',
+      'dynamodb:Query',
+    );
+    this.mpSecret.grantRead(this.payOverageFn);
+
     // ── Optional: EventBridge PutEvents ─────────────────────────────────────
     if (enableEventBridge) {
       const eventBridgePolicy = new iam.PolicyStatement({
@@ -530,6 +618,10 @@ export class SubscriptionModule extends Construct {
         this.getSubscriptionFn,
         this.cancelSubscriptionFn,
         this.trackUsageFn,
+        this.getUsageFn,
+        this.payOverageFn,
+        this.expireSubscriptionsFn,
+        this.monthlyCloseFn,
         this.webhookProcessorFn,
         this.subscriptionEventsProcessorFn,
       ];
@@ -608,6 +700,15 @@ export class SubscriptionModule extends Construct {
     const usageResource = meResource.addResource('usage');
     usageResource.addResource('{feature}').addMethod('POST', trackUsageIntegration, authorizedMethodOptions);
 
+    // GET /subscriptions/me/usage → get-usage (all features for current period)
+    const getUsageIntegration = new apigateway.LambdaIntegration(this.getUsageFn, { proxy: true });
+    usageResource.addMethod('GET', getUsageIntegration, authorizedMethodOptions);
+
+    // POST /subscriptions/me/pay-overage → pay-overage (one-time MP checkout)
+    const payOverageIntegration = new apigateway.LambdaIntegration(this.payOverageFn, { proxy: true });
+    const payOverageResource = meResource.addResource('pay-overage');
+    payOverageResource.addMethod('POST', payOverageIntegration, authorizedMethodOptions);
+
     // POST /subscriptions/{id}/cancel → cancel-subscription
     // {id} is the subscriptionId. The Lambda validates it belongs to the caller.
     const subscriptionByIdResource = subscriptionsResource.addResource('{id}');
@@ -652,6 +753,10 @@ export class SubscriptionModule extends Construct {
       { fn: this.getSubscriptionFn,             name: 'GetSubscription' },
       { fn: this.cancelSubscriptionFn,          name: 'CancelSubscription' },
       { fn: this.trackUsageFn,                  name: 'TrackUsage' },
+      { fn: this.getUsageFn,                    name: 'GetUsage' },
+      { fn: this.payOverageFn,                  name: 'PayOverage' },
+      { fn: this.expireSubscriptionsFn,         name: 'ExpireSubscriptions' },
+      { fn: this.monthlyCloseFn,                name: 'MonthlyClose' },
       { fn: this.webhookReceiverFn,             name: 'WebhookReceiver' },
       { fn: this.webhookProcessorFn,            name: 'WebhookProcessor' },
       { fn: this.subscriptionEventsProcessorFn, name: 'SubscriptionEventsProcessor' },

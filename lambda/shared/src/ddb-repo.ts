@@ -8,12 +8,14 @@ import {
   PutCommand,
   UpdateCommand,
   QueryCommand,
+  ScanCommand,
   type GetCommandInput,
   type PutCommandInput,
   type UpdateCommandInput,
   type QueryCommandInput,
+  type ScanCommandInput,
 } from '@aws-sdk/lib-dynamodb';
-import type { Subscription, Payment, UsageItem, SubscriptionEvent, Plan } from './types';
+import type { Subscription, Payment, UsageItem, SubscriptionEvent, Plan, BillingCycleRecord, BillingCycleStatus } from './types';
 
 // ─── Client ───────────────────────────────────────────────────────────────────
 
@@ -247,4 +249,176 @@ export async function writeEvent(event: SubscriptionEvent): Promise<void> {
     // so collisions are impossible. Plain Put is safe and avoids spurious errors on retries.
   };
   await ddb.send(new PutCommand(params));
+}
+
+// ─── BillingCycle CRUD ────────────────────────────────────────────────────────
+
+/**
+ * Create a billing cycle record.
+ * Idempotent: condition attribute_not_exists prevents duplicate writes (e.g. Lambda retry).
+ * Returns false if the record already exists, true if written.
+ */
+export async function createBillingCycle(cycle: BillingCycleRecord): Promise<boolean> {
+  const params: PutCommandInput = {
+    TableName: getCoreTableName(),
+    Item: cycle,
+    ConditionExpression: 'attribute_not_exists(PK)',
+  };
+  try {
+    await ddb.send(new PutCommand(params));
+    return true;
+  } catch (err) {
+    if (err instanceof ConditionalCheckFailedException) return false;
+    throw err;
+  }
+}
+
+/**
+ * Get a billing cycle by userId and period (YYYY-MM).
+ * Queries by SK prefix CYCLE#YYYY-MM to find the cycle for that month.
+ */
+export async function getBillingCycleByPeriod(
+  userId: string,
+  period: string, // YYYY-MM
+): Promise<BillingCycleRecord | null> {
+  const params: QueryCommandInput = {
+    TableName: getCoreTableName(),
+    KeyConditionExpression: 'PK = :pk AND begins_with(SK, :skPrefix)',
+    ExpressionAttributeValues: {
+      ':pk': `USER#${userId}`,
+      ':skPrefix': `CYCLE#${period}`,
+    },
+    Limit: 1,
+  };
+  const result = await ddb.send(new QueryCommand(params));
+  const items = result.Items;
+  if (!items || items.length === 0) return null;
+  return items[0] as BillingCycleRecord;
+}
+
+/**
+ * Update the status of a billing cycle record.
+ * Optionally sets extra fields (paymentId, etc.).
+ */
+export async function updateBillingCycleStatus(
+  userId: string,
+  sk: string,
+  status: BillingCycleStatus,
+  extras?: Partial<BillingCycleRecord>,
+): Promise<void> {
+  const now = new Date().toISOString();
+  const expressionAttributeNames: Record<string, string> = { '#status': 'status' };
+  const expressionAttributeValues: Record<string, unknown> = {
+    ':status': status,
+    ':now': now,
+  };
+
+  let setExpression = 'SET #status = :status, updatedAt = :now';
+
+  if (extras) {
+    let i = 0;
+    for (const [key, value] of Object.entries(extras)) {
+      if (['PK', 'SK', 'entity', 'status', 'updatedAt', 'createdAt'].includes(key)) continue;
+      const nameRef = `#ex${i}`;
+      const valueRef = `:ex${i}`;
+      setExpression += `, ${nameRef} = ${valueRef}`;
+      expressionAttributeNames[nameRef] = key;
+      expressionAttributeValues[valueRef] = value;
+      i++;
+    }
+  }
+
+  const params: UpdateCommandInput = {
+    TableName: getCoreTableName(),
+    Key: {
+      PK: `USER#${userId}`,
+      SK: sk,
+    },
+    UpdateExpression: setExpression,
+    ExpressionAttributeNames: expressionAttributeNames,
+    ExpressionAttributeValues: expressionAttributeValues,
+  };
+  await ddb.send(new UpdateCommand(params));
+}
+
+/**
+ * Query all usage items for a subscription (all features in one query).
+ * Returns a map of feature → count.
+ */
+export async function getAllUsageForSubscription(
+  userId: string,
+  subscriptionId: string,
+): Promise<Record<string, number>> {
+  const params: QueryCommandInput = {
+    TableName: getCoreTableName(),
+    KeyConditionExpression: 'PK = :pk AND begins_with(SK, :skPrefix)',
+    ExpressionAttributeValues: {
+      ':pk': `USER#${userId}`,
+      ':skPrefix': `USAGE#`,
+    },
+  };
+  const result = await ddb.send(new QueryCommand(params));
+  const usageMap: Record<string, number> = {};
+  for (const item of result.Items ?? []) {
+    // SK format: USAGE#feature#subscriptionId
+    const sk: string = item.SK as string;
+    const parts = sk.split('#');
+    // parts[0] = USAGE, parts[1] = feature, parts[2] = subscriptionId
+    if (parts.length >= 3 && parts[2] === subscriptionId) {
+      usageMap[parts[1]] = (item.count as number) ?? 0;
+    }
+  }
+  return usageMap;
+}
+
+/**
+ * Scan all subscription items with a given status.
+ * Used by expire-subscriptions and monthly-close Lambdas.
+ * Table is small in dev — FilterExpression scan is acceptable.
+ */
+export async function scanSubscriptionsByStatus(
+  statuses: string[],
+): Promise<Subscription[]> {
+  const filterParts = statuses.map((_, i) => `#status = :s${i}`);
+  const expressionAttributeValues: Record<string, unknown> = {};
+  statuses.forEach((s, i) => { expressionAttributeValues[`:s${i}`] = s; });
+
+  const params: ScanCommandInput = {
+    TableName: getCoreTableName(),
+    FilterExpression: `entity = :entity AND (${filterParts.join(' OR ')})`,
+    ExpressionAttributeNames: { '#status': 'status' },
+    ExpressionAttributeValues: {
+      ':entity': 'subscription',
+      ...expressionAttributeValues,
+    },
+  };
+  const result = await ddb.send(new ScanCommand(params));
+  return (result.Items ?? []) as Subscription[];
+}
+
+/**
+ * Read usage count for a feature scoped to a specific period (YYYY-MM).
+ * Used by monthly-close to calculate overage.
+ */
+export async function getUsageByPeriod(
+  userId: string,
+  feature: string,
+  period: string, // YYYY-MM
+): Promise<number> {
+  // Usage items use subscriptionId as period key in real-time tracking,
+  // but for monthly-close we query by the period prefix
+  const params: QueryCommandInput = {
+    TableName: getCoreTableName(),
+    KeyConditionExpression: 'PK = :pk AND begins_with(SK, :skPrefix)',
+    ExpressionAttributeValues: {
+      ':pk': `USER#${userId}`,
+      ':skPrefix': `USAGE#${feature}#`,
+    },
+    ProjectionExpression: '#count, SK',
+    ExpressionAttributeNames: { '#count': 'count' },
+  };
+  const result = await ddb.send(new QueryCommand(params));
+  // Sum all usage items for this feature (in case of multiple subscription periods)
+  const total = (result.Items ?? []).reduce((sum: number, item: Record<string, unknown>) => sum + ((item.count as number) ?? 0), 0);
+  return total;
 }

@@ -67,27 +67,8 @@ export const handler: APIGatewayProxyHandler = async (event) => {
     // 5. Read current usage for this subscription period
     const currentUsage = await getUsage(userId, feature, sub.subscriptionId);
 
-    // 6. Check allowance before incrementing
+    // 6. Check allowance — always allows (overage accumulates, billed at month close)
     const check = checkFeatureAllowance(sub, feature, currentUsage);
-    if (!check.allowed) {
-      logger.info('track-usage: limit reached', {
-        userId,
-        subscriptionId: sub.subscriptionId,
-        feature,
-        limit,
-        used: currentUsage,
-      });
-      return {
-        statusCode: 429,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          allowed:   false,
-          remaining: 0,
-          limit,
-          used:      currentUsage,
-        }),
-      };
-    }
 
     // 7. Atomically increment — returns new count
     const newCount = await incrementUsage(userId, feature, sub.subscriptionId);
@@ -98,16 +79,19 @@ export const handler: APIGatewayProxyHandler = async (event) => {
       feature,
       used: newCount,
       limit,
+      overage: check.overage,
     });
 
     return {
       statusCode: 200,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        allowed:   true,
-        remaining: Math.max(0, limit - newCount),
+        allowed:      true,
+        overage:      check.overage,
+        overageUnits: check.overage ? newCount - limit : 0,
+        remaining:    Math.max(0, limit - newCount),
         limit,
-        used:      newCount,
+        used:         newCount,
       }),
     };
   } catch (error) {

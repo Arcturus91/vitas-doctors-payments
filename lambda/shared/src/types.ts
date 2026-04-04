@@ -1,12 +1,13 @@
 // ─── Domain Enums ─────────────────────────────────────────────────────────────
 
 export type SubscriptionStatus =
-  | 'PENDING'        // checkout created, awaiting first payment
-  | 'TRIAL'          // within trial period (no payment required yet)
-  | 'ACTIVE'         // paid and active
-  | 'PAST_DUE'       // payment failed, within grace period
-  | 'PENDING_CANCEL' // cancellation requested, access until period ends
-  | 'CANCELED';      // fully canceled
+  | 'PENDING'              // checkout created, awaiting first payment
+  | 'TRIAL'                // within trial period (no payment required yet)
+  | 'ACTIVE'               // paid and active
+  | 'PAST_DUE'             // payment failed, within grace period
+  | 'PENDING_CANCEL'       // cancellation requested, access until period ends
+  | 'CANCELED'             // fully canceled
+  | 'DOWNGRADED_TO_MANUAL'; // trial/grace expired — AI disabled, manual mode only
 
 export type BillingCycle = 'monthly' | 'yearly';
 
@@ -133,7 +134,47 @@ export interface AuthContext {
 
 export interface FeatureCheckResult {
   allowed: boolean;
-  remaining: number; // how many units left this period (0 if denied)
-  limit: number;     // the plan limit for this feature
-  current: number;   // current usage this period
+  overage: boolean;      // true when usage >= limit but overage is permitted
+  overageUnits: number;  // units above the limit (0 if not over)
+  remaining: number;     // how many units left before hitting limit (0 if at/over)
+  limit: number;         // the plan limit for this feature
+  current: number;       // current usage this period
+}
+
+// ─── Billing Cycle ────────────────────────────────────────────────────────────
+
+export type BillingCycleStatus =
+  | 'OPEN'             // current in-progress cycle
+  | 'CLOSED'           // closed with no overage
+  | 'PENDING_PAYMENT'  // closed with unpaid overage
+  | 'CHARGED'          // overage paid successfully
+  | 'FAILED';          // overage payment failed
+
+/**
+ * SaasCore_Table — CYCLE entity.
+ * PK = USER#userId, SK = CYCLE#YYYY-MM#cycleId
+ *
+ * Created by monthly-close Lambda at the start of each new month.
+ * Stores frozen usage snapshot and overage calculation for the closed period.
+ */
+export interface BillingCycleRecord {
+  PK: string;                    // USER#userId
+  SK: string;                    // CYCLE#YYYY-MM#cycleId
+  entity: 'billing_cycle';
+  cycleId: string;               // UUID
+  userId: string;
+  subscriptionId: string;
+  period: string;                // YYYY-MM of the closed cycle
+  startDate: string;             // ISO 8601
+  endDate: string;               // ISO 8601
+  status: BillingCycleStatus;
+  frozenUsage: Record<string, number>;    // snapshot of usage at close
+  includedLimits: Record<string, number>; // copy of limitsCached at close
+  overageUnits: Record<string, number>;   // units above limit per feature
+  overageAmount: number;                  // total overage cost in local currency
+  overageCurrency: string;               // e.g. "PEN"
+  paymentId?: string;
+  consecutiveUnpaidCount: number;        // cycles with unpaid overage in a row
+  createdAt: string;
+  updatedAt: string;
 }
