@@ -149,6 +149,9 @@ export class SubscriptionModule extends Construct {
   /** Lambda: creates a one-time MP checkout for outstanding overage payment */
   public readonly payOverageFn: lambdaNodejs.NodejsFunction;
 
+  /** Lambda: activates a free trial subscription without payment provider */
+  public readonly startTrialFn: lambdaNodejs.NodejsFunction;
+
   /** CloudWatch alarm that fires when any message lands in the webhook DLQ */
   public readonly dlqDepthAlarm: cloudwatch.Alarm;
 
@@ -409,7 +412,12 @@ export class SubscriptionModule extends Construct {
     this.payOverageFn = makeFn('PayOverageFn', 'pay-overage', 30, {
       ...authEnv,
       MP_SECRET_ARN:  this.mpSecret.secretArn,
-      FRONTEND_URL:   '',  // override per deployment via environment variable or stack props
+      FRONTEND_URL:   'https://vitashceai.vitasclinic.com/',  // override per deployment via environment variable or stack props
+    });
+
+    // POST /subscriptions/start-trial — free trial, no payment provider
+    this.startTrialFn = makeFn('StartTrialFn', 'start-trial', 10, {
+      ...authEnv,
     });
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -494,6 +502,7 @@ export class SubscriptionModule extends Construct {
       this.trackUsageFn,
       this.getUsageFn,
       this.payOverageFn,
+      this.startTrialFn,
     ]) {
       fn.addToRolePolicy(ssmJwtPolicy);
       fn.addToRolePolicy(kmsDecryptPolicy);
@@ -504,6 +513,11 @@ export class SubscriptionModule extends Construct {
     this.plansTable.grant(this.createSubscriptionFn, 'dynamodb:GetItem');
     this.saasCoreTable.grant(this.createSubscriptionFn, 'dynamodb:GetItem', 'dynamodb:PutItem');
     this.mpSecret.grantRead(this.createSubscriptionFn);
+
+    // ── start-trial ──────────────────────────────────────────────────────────
+    // Reads plan → reads existing subscription (conflict check) → writes TRIAL item
+    this.plansTable.grant(this.startTrialFn, 'dynamodb:GetItem');
+    this.saasCoreTable.grant(this.startTrialFn, 'dynamodb:GetItem', 'dynamodb:PutItem');
 
     // ── get-subscription ─────────────────────────────────────────────────────
     // Read-only: returns USER#userId / SUBSCRIPTION#primary item
@@ -620,6 +634,7 @@ export class SubscriptionModule extends Construct {
         this.trackUsageFn,
         this.getUsageFn,
         this.payOverageFn,
+        this.startTrialFn,
         this.expireSubscriptionsFn,
         this.monthlyCloseFn,
         this.webhookProcessorFn,
@@ -685,6 +700,11 @@ export class SubscriptionModule extends Construct {
         'application/json': apigateway.Model.EMPTY_MODEL,
       },
     });
+
+    // POST /subscriptions/start-trial → start-trial (no payment provider, immediate TRIAL status)
+    const startTrialIntegration = new apigateway.LambdaIntegration(this.startTrialFn, { proxy: true });
+    const startTrialResource = subscriptionsResource.addResource('start-trial');
+    startTrialResource.addMethod('POST', startTrialIntegration, authorizedMethodOptions);
 
     // GET /subscriptions/me → get-subscription
     // Uses a fixed 'me' path so the Lambda resolves userId from auth context,
@@ -755,6 +775,7 @@ export class SubscriptionModule extends Construct {
       { fn: this.trackUsageFn,                  name: 'TrackUsage' },
       { fn: this.getUsageFn,                    name: 'GetUsage' },
       { fn: this.payOverageFn,                  name: 'PayOverage' },
+      { fn: this.startTrialFn,                  name: 'StartTrial' },
       { fn: this.expireSubscriptionsFn,         name: 'ExpireSubscriptions' },
       { fn: this.monthlyCloseFn,                name: 'MonthlyClose' },
       { fn: this.webhookReceiverFn,             name: 'WebhookReceiver' },

@@ -108,6 +108,22 @@ export async function createSubscription(subscription: Subscription): Promise<vo
 }
 
 /**
+ * Write a TRIAL subscription created without a payment provider.
+ * Allows overwriting PENDING (abandoned checkout) or CANCELED (previous paid subscription).
+ * Throws ConditionalCheckFailedException if an active subscription already exists.
+ */
+export async function createTrialSubscription(subscription: Subscription): Promise<void> {
+  const params: PutCommandInput = {
+    TableName: getCoreTableName(),
+    Item: subscription,
+    ConditionExpression: 'attribute_not_exists(PK) OR #s IN (:pending, :canceled)',
+    ExpressionAttributeNames: { '#s': 'status' },
+    ExpressionAttributeValues: { ':pending': 'PENDING', ':canceled': 'CANCELED' },
+  };
+  await ddb.send(new PutCommand(params));
+}
+
+/**
  * Atomically update subscription status.
  * Uses a condition expression to prevent race conditions
  * (e.g. only update from PENDING → ACTIVE if still PENDING).
