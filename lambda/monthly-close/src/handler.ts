@@ -4,6 +4,8 @@ import {
   getAllUsageForSubscription,
   getBillingCycleByPeriod,
   createBillingCycle,
+  updateSubscriptionStatus,
+  ConditionalCheckFailedException,
 } from '../../shared/src/ddb-repo';
 import { logger } from '../../shared/src/logger';
 import type { BillingCycleRecord } from '../../shared/src/types';
@@ -120,15 +122,23 @@ export const handler = async (): Promise<void> => {
           consecutiveUnpaidCount,
         }, 'monthly-close: PENDING_PAYMENT cycle created');
 
-        // C2 policy: 2 consecutive unpaid cycles → mark for downgrade
+        // C2 policy: 2 consecutive unpaid cycles → downgrade to manual mode
         if (consecutiveUnpaidCount >= 2) {
-          logger.warn(
-            { userId: sub.userId, consecutiveUnpaidCount },
-            'monthly-close: 2 consecutive unpaid cycles — doctor flagged for DOWNGRADED_TO_MANUAL',
-          );
-          // Note: actual status change is handled by expire-subscriptions or a dedicated cron.
-          // For now we log the flag — a follow-up step can scan for consecutiveUnpaidCount >= 2
-          // and emit an EventBridge event or update the subscription directly.
+          try {
+            await updateSubscriptionStatus(sub.userId, 'DOWNGRADED_TO_MANUAL', sub.status, {
+              downgradeReason: 'OVERAGE_NON_PAYMENT',
+            });
+            logger.warn(
+              { userId: sub.userId, consecutiveUnpaidCount },
+              'monthly-close: downgraded to DOWNGRADED_TO_MANUAL — 2 consecutive unpaid cycles',
+            );
+          } catch (err) {
+            if (err instanceof ConditionalCheckFailedException) {
+              logger.info({ userId: sub.userId }, 'monthly-close: C2 downgrade skipped — status already changed');
+            } else {
+              throw err;
+            }
+          }
         }
       } else {
         closed++;

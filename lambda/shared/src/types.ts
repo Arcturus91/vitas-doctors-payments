@@ -66,6 +66,8 @@ export interface Subscription {
   canceledAt?: string;                  // ISO 8601
   expiresAt?: string;                   // ISO 8601 — set on payment success (one-time billing)
   ttl?: number;                         // Unix epoch seconds — DynamoDB TTL attribute
+  /** Reason the subscription was moved to DOWNGRADED_TO_MANUAL */
+  downgradeReason?: 'TRIAL_EXPIRED' | 'GRACE_EXPIRED' | 'OVERAGE_NON_PAYMENT';
   createdAt: string;
   updatedAt: string;
 }

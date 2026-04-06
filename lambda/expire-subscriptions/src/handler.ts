@@ -56,12 +56,12 @@ async function tryExpire(
 
   if (sub.status === 'TRIAL') {
     if (!sub.trialEndsAt || sub.trialEndsAt > now) return 'skipped';
-    return transitionStatus(tableName, sub, 'TRIAL', 'DOWNGRADED_TO_MANUAL', 'expired');
+    return transitionStatus(tableName, sub, 'TRIAL', 'DOWNGRADED_TO_MANUAL', 'expired', 'TRIAL_EXPIRED');
   }
 
   if (sub.status === 'PAST_DUE') {
     if (!sub.graceEndsAt || sub.graceEndsAt > now) return 'skipped';
-    return transitionStatus(tableName, sub, 'PAST_DUE', 'DOWNGRADED_TO_MANUAL', 'expired');
+    return transitionStatus(tableName, sub, 'PAST_DUE', 'DOWNGRADED_TO_MANUAL', 'expired', 'GRACE_EXPIRED');
   }
 
   if (sub.status === 'PENDING') {
@@ -78,19 +78,27 @@ async function transitionStatus(
   expectedStatus: string,
   newStatus: string,
   resultLabel: 'expired' | 'abandoned',
+  downgradeReason?: 'TRIAL_EXPIRED' | 'GRACE_EXPIRED' | 'OVERAGE_NON_PAYMENT',
 ): Promise<'expired' | 'abandoned' | 'skipped'> {
   try {
+    const now = new Date().toISOString();
+    const updateExpr = downgradeReason
+      ? 'SET #status = :newStatus, updatedAt = :now, downgradeReason = :reason'
+      : 'SET #status = :newStatus, updatedAt = :now';
+    const exprValues: Record<string, unknown> = {
+      ':newStatus': newStatus,
+      ':expectedStatus': expectedStatus,
+      ':now': now,
+    };
+    if (downgradeReason) exprValues[':reason'] = downgradeReason;
+
     await ddb.send(new UpdateCommand({
       TableName: tableName,
       Key: { PK: sub.PK, SK: sub.SK },
-      UpdateExpression: 'SET #status = :newStatus, updatedAt = :now',
+      UpdateExpression: updateExpr,
       ConditionExpression: 'attribute_exists(PK) AND #status = :expectedStatus',
       ExpressionAttributeNames: { '#status': 'status' },
-      ExpressionAttributeValues: {
-        ':newStatus': newStatus,
-        ':expectedStatus': expectedStatus,
-        ':now': new Date().toISOString(),
-      },
+      ExpressionAttributeValues: exprValues,
     }));
 
     logger.info(
