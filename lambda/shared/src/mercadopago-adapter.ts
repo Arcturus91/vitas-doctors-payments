@@ -102,27 +102,29 @@ export class MercadoPagoAdapter implements IPaymentProvider {
   // ─── IPaymentProvider implementation ─────────────────────────────────────
 
   /**
-   * Create a one-time payment preference via POST /checkout/preferences.
-   * Returns the MP checkout URL (init_point) for the user to complete payment.
+   * Create a recurring subscription via POST /preapproval.
+   * Returns the MP checkout URL (init_point) for the user to register a payment method.
    *
-   * Uses Checkout Pro instead of Preapproval — no payer_email required,
-   * works in sandbox without test user restrictions.
+   * Uses Preapproval API for automatic monthly charges.
+   * payer_email is required by MP to pre-fill the checkout form.
    *
-   * MP Checkout Pro docs: https://www.mercadopago.com.ar/developers/es/reference/preferences/_checkout_preferences/post
+   * MP Preapproval docs: https://www.mercadopago.com.ar/developers/es/reference/subscriptions/_preapproval/post
    */
   async createSubscription(input: CreateSubscriptionInput): Promise<CreateSubscriptionResult> {
     const billingLabel = input.billingCycle === 'yearly' ? 'anual' : 'mensual';
 
+    const frequency      = input.billingCycle === 'yearly' ? 12 : 1;
+    const frequencyType  = 'months';
+
     const requestBody: Record<string, unknown> = {
-      items: [
-        {
-          id:         input.planId,
-          title:      `${input.planName} — ${billingLabel}`,
-          quantity:   1,
-          unit_price: input.amount,
-          currency_id: input.currency,
-        },
-      ],
+      reason: `${input.planName} — ${billingLabel}`,
+      auto_recurring: {
+        frequency,
+        frequency_type: frequencyType,
+        transaction_amount: input.amount,
+        currency_id: input.currency,
+      },
+      status: 'pending',
       metadata: {
         user_id: input.userId,
         plan_id: input.planId,
@@ -130,22 +132,15 @@ export class MercadoPagoAdapter implements IPaymentProvider {
       },
     };
 
-    if (input.backUrl) {
-      requestBody['back_urls'] = {
-        success: input.backUrl,
-        failure: input.backUrl,
-        pending: input.backUrl,
-      };
-      requestBody['auto_return'] = 'approved';
-    }
-
+    if (input.payerEmail) requestBody['payer_email'] = input.payerEmail;
+    if (input.backUrl)    requestBody['back_url']    = input.backUrl;
     if (input.notificationUrl) requestBody['notification_url'] = input.notificationUrl;
 
     const result = await this.mpFetch<{ id: string; init_point: string }>(
-      'POST', '/checkout/preferences', requestBody,
+      'POST', '/preapproval', requestBody,
     );
 
-    logger.info('MercadoPago: checkout preference created', {
+    logger.info('MercadoPago: preapproval created', {
       providerSubscriptionId: result.id,
     });
 

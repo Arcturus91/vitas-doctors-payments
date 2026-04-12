@@ -80,6 +80,8 @@ class VitasPaymentsStack extends cdk.Stack {
       useFifoQueue:     isProd,
       // Always emit EventBridge events — vitas-main-stack subscribes to apply its own side-effects
       enableEventBridge: true,
+      // Sandbox test user — MP requires both collector and payer to be test users in dev
+      ...(!isProd ? { defaultPayerEmail: 'test_user_3491999667425078735@testuser.com' } : {}),
 
       // Optional: set this to an existing SNS topic ARN to receive alarm notifications
       // alarmTopicArn: `arn:aws:sns:sa-east-1:${this.account}:vitas-ops-alerts`,

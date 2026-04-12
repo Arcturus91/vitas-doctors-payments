@@ -80,6 +80,12 @@ export interface SubscriptionModuleProps {
    * at a different SSM path (e.g. '/clinicpro/auth/jwt-secret').
    */
   jwtSecretParam?: string;
+
+  /**
+   * Fallback payer email for MercadoPago Preapproval when the frontend doesn't supply one.
+   * Use a sandbox test user email in dev. Leave unset in production.
+   */
+  defaultPayerEmail?: string;
 }
 
 // ─── Construct ────────────────────────────────────────────────────────────────
@@ -355,10 +361,22 @@ export class SubscriptionModule extends Construct {
 
     // POST /subscriptions — calls Plans_Table, MercadoPago, writes SaasCore
     // authEnv: JWT is validated inside the Lambda (no API GW TOKEN authorizer needed)
+    // Webhook notification URL — built from the restApi ID so MP knows where to POST events.
+    // Using a resolved env var is more reliable than deriving it from event.requestContext at runtime.
+    const webhookNotificationUrl = cdk.Fn.join('', [
+      'https://',
+      props.restApi.restApiId,
+      '.execute-api.',
+      cdk.Stack.of(this).region,
+      '.amazonaws.com/prod/webhooks/mercadopago',
+    ]);
+
     this.createSubscriptionFn = makeFn('CreateSubscriptionFn', 'create-subscription', 30, {
       ...authEnv,
-      MP_SECRET_ARN:      this.mpSecret.secretArn,
-      WEBHOOK_QUEUE_URL:  this.webhookQueue.queueUrl,
+      MP_SECRET_ARN:             this.mpSecret.secretArn,
+      WEBHOOK_QUEUE_URL:         this.webhookQueue.queueUrl,
+      WEBHOOK_NOTIFICATION_URL:  webhookNotificationUrl,
+      ...(props.defaultPayerEmail ? { MP_DEFAULT_PAYER_EMAIL: props.defaultPayerEmail } : {}),
     });
 
     // GET /subscriptions/me — reads SaasCore

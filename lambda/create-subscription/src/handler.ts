@@ -33,6 +33,7 @@ export const handler: APIGatewayProxyHandler = async (event) => {
       planId?: string;
       billingCycle?: string;
       backUrl?: string;
+      payerEmail?: string;
     };
 
     if (!body.planId) {
@@ -59,12 +60,8 @@ export const handler: APIGatewayProxyHandler = async (event) => {
       );
     }
 
-    // ── Build notification URL from the gateway domain ────────────────────
-    const domain = event.requestContext.domainName;
-    const stage  = event.requestContext.stage;
-    const notificationUrl = domain
-      ? `https://${domain}/${stage}/webhooks/mercadopago`
-      : undefined;
+    // ── Notification URL — resolved at deploy time via env var (more reliable than requestContext) ──
+    const notificationUrl = process.env.WEBHOOK_NOTIFICATION_URL;
 
     // ── Call payment provider ─────────────────────────────────────────────
     const token    = await getMercadoPagoAccessToken();
@@ -77,7 +74,7 @@ export const handler: APIGatewayProxyHandler = async (event) => {
       billingCycle,
       amount:    plan.price,
       currency:  plan.currency,
-      trialDays: plan.trialDays > 0 ? plan.trialDays : undefined,
+      payerEmail:      process.env.MP_DEFAULT_PAYER_EMAIL ?? body.payerEmail,
       backUrl:         body.backUrl,
       notificationUrl,
     });
