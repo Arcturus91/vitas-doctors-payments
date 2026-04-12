@@ -158,6 +158,12 @@ export class SubscriptionModule extends Construct {
   /** Lambda: activates a free trial subscription without payment provider */
   public readonly startTrialFn: lambdaNodejs.NodejsFunction;
 
+  /** Lambda: syncs subscription status from MP on checkout return (PENDING → ACTIVE without waiting for webhook) */
+  public readonly syncSubscriptionFn: lambdaNodejs.NodejsFunction;
+
+  /** Lambda: every-5-min cron — syncs all PENDING subscriptions from MP (server-side, no browser dependency) */
+  public readonly syncPendingSubscriptionsFn: lambdaNodejs.NodejsFunction;
+
   /** CloudWatch alarm that fires when any message lands in the webhook DLQ */
   public readonly dlqDepthAlarm: cloudwatch.Alarm;
 
@@ -438,6 +444,18 @@ export class SubscriptionModule extends Construct {
       ...authEnv,
     });
 
+    // POST /subscriptions/me/sync — checks MP preapproval status on checkout return and activates
+    this.syncSubscriptionFn = makeFn('SyncSubscriptionFn', 'sync-subscription', 15, {
+      ...authEnv,
+      MP_SECRET_ARN: this.mpSecret.secretArn,
+    });
+
+    // EventBridge every-5-min cron — syncs all PENDING subscriptions from MP
+    // Server-side fallback: activates subscriptions even when the user never returns to the browser
+    this.syncPendingSubscriptionsFn = makeFn('SyncPendingSubscriptionsFn', 'sync-pending-subscriptions', 60, {
+      MP_SECRET_ARN: this.mpSecret.secretArn,
+    });
+
     // ─────────────────────────────────────────────────────────────────────────
     // Stage 4f — Event sources
     // ─────────────────────────────────────────────────────────────────────────
@@ -475,6 +493,15 @@ export class SubscriptionModule extends Construct {
         ],
       }),
     );
+
+    // EventBridge every-5-min rule → sync-pending-subscriptions
+    // Activates PENDING subscriptions by polling MP directly — no browser dependency.
+    new events.Rule(this, 'SyncPendingSubscriptionsRule', {
+      ruleName:    `${prefix}-sync-pending-subscriptions-${env}`,
+      description: 'Every 5 min: sync PENDING subscriptions from MercadoPago (server-side activation)',
+      schedule:    events.Schedule.rate(cdk.Duration.minutes(5)),
+      targets:     [new eventsTargets.LambdaFunction(this.syncPendingSubscriptionsFn)],
+    });
 
     // EventBridge hourly rule → expire-subscriptions
     new events.Rule(this, 'ExpireSubscriptionsRule', {
@@ -521,6 +548,7 @@ export class SubscriptionModule extends Construct {
       this.getUsageFn,
       this.payOverageFn,
       this.startTrialFn,
+      this.syncSubscriptionFn,
     ]) {
       fn.addToRolePolicy(ssmJwtPolicy);
       fn.addToRolePolicy(kmsDecryptPolicy);
@@ -536,6 +564,16 @@ export class SubscriptionModule extends Construct {
     // Reads plan → reads existing subscription (conflict check) → writes TRIAL item
     this.plansTable.grant(this.startTrialFn, 'dynamodb:GetItem');
     this.saasCoreTable.grant(this.startTrialFn, 'dynamodb:GetItem', 'dynamodb:PutItem');
+
+    // ── sync-subscription ────────────────────────────────────────────────────
+    // Reads subscription → calls MP API → conditionally updates status
+    this.saasCoreTable.grant(this.syncSubscriptionFn, 'dynamodb:GetItem', 'dynamodb:UpdateItem');
+    this.mpSecret.grantRead(this.syncSubscriptionFn);
+
+    // ── sync-pending-subscriptions ───────────────────────────────────────────
+    // Scans all PENDING subscriptions → calls MP API for each → conditionally updates status
+    this.saasCoreTable.grant(this.syncPendingSubscriptionsFn, 'dynamodb:Scan', 'dynamodb:UpdateItem');
+    this.mpSecret.grantRead(this.syncPendingSubscriptionsFn);
 
     // ── get-subscription ─────────────────────────────────────────────────────
     // Read-only: returns USER#userId / SUBSCRIPTION#primary item
@@ -655,6 +693,7 @@ export class SubscriptionModule extends Construct {
         this.startTrialFn,
         this.expireSubscriptionsFn,
         this.monthlyCloseFn,
+        this.syncPendingSubscriptionsFn,
         this.webhookProcessorFn,
         this.subscriptionEventsProcessorFn,
       ];
@@ -747,6 +786,11 @@ export class SubscriptionModule extends Construct {
     const payOverageResource = meResource.addResource('pay-overage');
     payOverageResource.addMethod('POST', payOverageIntegration, authorizedMethodOptions);
 
+    // POST /subscriptions/me/sync → sync-subscription (check MP status on checkout return)
+    const syncSubIntegration = new apigateway.LambdaIntegration(this.syncSubscriptionFn, { proxy: true });
+    const syncResource = meResource.addResource('sync');
+    syncResource.addMethod('POST', syncSubIntegration, authorizedMethodOptions);
+
     // POST /subscriptions/{id}/cancel → cancel-subscription
     // {id} is the subscriptionId. The Lambda validates it belongs to the caller.
     const subscriptionByIdResource = subscriptionsResource.addResource('{id}');
@@ -796,6 +840,7 @@ export class SubscriptionModule extends Construct {
       { fn: this.startTrialFn,                  name: 'StartTrial' },
       { fn: this.expireSubscriptionsFn,         name: 'ExpireSubscriptions' },
       { fn: this.monthlyCloseFn,                name: 'MonthlyClose' },
+      { fn: this.syncPendingSubscriptionsFn,    name: 'SyncPendingSubscriptions' },
       { fn: this.webhookReceiverFn,             name: 'WebhookReceiver' },
       { fn: this.webhookProcessorFn,            name: 'WebhookProcessor' },
       { fn: this.subscriptionEventsProcessorFn, name: 'SubscriptionEventsProcessor' },
