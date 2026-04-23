@@ -52,7 +52,20 @@ export const handler: APIGatewayProxyHandler = async (event) => {
       );
     }
 
-    logger.info('track-usage: request', { userId, feature });
+    // Optional quantity from body (e.g. scribe_minutes sends actual minutes consumed)
+    let quantity = 1;
+    if (event.body) {
+      try {
+        const body = JSON.parse(event.body);
+        if (typeof body.quantity === 'number' && body.quantity > 0) {
+          quantity = Math.ceil(body.quantity);
+        }
+      } catch {
+        // Malformed body — fall back to quantity=1
+      }
+    }
+
+    logger.info('track-usage: request', { userId, feature, quantity });
 
     // 2. Load subscription
     const sub = await getSubscription(userId);
@@ -71,7 +84,7 @@ export const handler: APIGatewayProxyHandler = async (event) => {
     const check = checkFeatureAllowance(sub, feature, currentUsage);
 
     // 7. Atomically increment — returns new count
-    const newCount = await incrementUsage(userId, feature, sub.subscriptionId);
+    const newCount = await incrementUsage(userId, feature, sub.subscriptionId, quantity);
 
     logger.info('track-usage: usage recorded', {
       userId,

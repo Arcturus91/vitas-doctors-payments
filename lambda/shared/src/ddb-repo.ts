@@ -227,11 +227,13 @@ export async function getUsage(
  * Atomically increment a usage counter for the current billing period.
  * Returns the new count after increment.
  * Uses DynamoDB ADD — safe for concurrent calls.
+ * quantity defaults to 1; pass a larger value for bulk tracking (e.g. scribe_minutes).
  */
 export async function incrementUsage(
   userId: string,
   feature: string,
   period: string, // YYYY-MM or subscriptionId for per-subscription tracking
+  quantity = 1,
 ): Promise<number> {
   const params: UpdateCommandInput = {
     TableName: getCoreTableName(),
@@ -244,13 +246,13 @@ export async function incrementUsage(
       '#count': 'count',
     },
     ExpressionAttributeValues: {
-      ':inc': 1,
+      ':inc': quantity,
       ':entity': 'usage',
     },
     ReturnValues: 'ALL_NEW',
   };
   const result = await ddb.send(new UpdateCommand(params));
-  return (result.Attributes?.count as number) ?? 1;
+  return (result.Attributes?.count as number) ?? quantity;
 }
 
 /**
